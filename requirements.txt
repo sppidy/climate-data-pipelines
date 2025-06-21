@@ -1,0 +1,13 @@
+xarray
+pandas
+numpy
+geopandas
+shapely
+global-land-mask
+tqdm
+boto3
+requests
+netCDF4
+rasterio
+fiona
+pyproj 
