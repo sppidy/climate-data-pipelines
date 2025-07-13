@@ -347,115 +347,25 @@ class HumidityProcessor:
             print(f"✅ Created {successful}/{len(monthly_files)} GeoJSON files")
         return geojson_files
 
-    def mbtiles_to_pbf_and_upload(self, mbtiles_file):
-        """Convert MBTiles to PBF format and upload to S3"""
-        if self.dry_run:
-            print(f"[DRY RUN] Would convert {mbtiles_file} to PBF and upload to S3")
-            return True
-            
-        try:
-            if self.verbose:
-                print(f"🔧 Converting {mbtiles_file} to PBF format...")
-            
-            # Extract base name for output directory
-            base_name = os.path.basename(mbtiles_file).replace('.mbtiles', '')
-            pbf_output_dir = os.path.join(self.MBTILES_DIR, f"{base_name}_pbf")
-            
-            # Create output directory
-            os.makedirs(pbf_output_dir, exist_ok=True)
-            
-            # Use mb-util to extract MBTiles to PBF format
-            cmd = [
-                "mb-util",
-                "--image_format=pbf",
-                mbtiles_file,
-                pbf_output_dir
-            ]
-            
-            if self.verbose:
-                print(f"Running: {' '.join(cmd)}")
-            
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            
-            if result.returncode != 0:
-                print(f"❌ mb-util failed: {result.stderr}")
-                return False
-            
-            if self.verbose:
-                print(f"✅ Created PBF tiles in: {pbf_output_dir}")
-            
-            # Upload to S3
-            if self.upload_pbf_to_s3(pbf_output_dir, base_name):
-                if self.verbose:
-                    print(f"✅ Successfully uploaded PBF tiles to S3 for {base_name}")
-                return True
-            else:
-                print(f"❌ Failed to upload PBF tiles to S3 for {base_name}")
-                return False
-                
-        except Exception as e:
-            print(f"❌ Error converting MBTiles to PBF: {e}")
-            if self.verbose:
-                traceback.print_exc()
-            return False
 
-    def upload_pbf_to_s3(self, pbf_dir, layer_name):
-        """Upload PBF tiles to S3 for CloudFront serving"""
-        try:
-            if self.verbose:
-                print(f"📤 Uploading PBF tiles to S3 for layer: {layer_name}")
-            
-            # S3 path for tiles
-            s3_tiles_path = f"s3://{CLIMATE_DATA_BUCKET}/tiles/{layer_name}"
-            
-            # Sync PBF tiles to S3
-            cmd = [
-                "aws", "s3", "sync",
-                pbf_dir,
-                s3_tiles_path,
-                "--region", "ap-south-1",
-                "--content-type", "application/x-protobuf"
-            ]
-            
-            if self.verbose:
-                print(f"Running: {' '.join(cmd)}")
-            
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            
-            if result.returncode == 0:
-                if self.verbose:
-                    print(f"✅ Successfully synced PBF tiles to S3: {s3_tiles_path}")
-                    if result.stdout:
-                        print(f"Sync output: {result.stdout}")
-                return True
-            else:
-                print(f"❌ Failed to sync PBF tiles to S3: {result.stderr}")
-                return False
-                
-        except Exception as e:
-            print(f"❌ Error uploading PBF tiles to S3: {e}")
-            if self.verbose:
-                traceback.print_exc()
-            return False
 
     def create_mbtiles(self, geojson_files):
-        """Create MBTiles from GeoJSON files and convert to PBF"""
+        """Create MBTiles from GeoJSON files"""
         if self.skip_mbtiles:
             print("\n[STEP 4] Skipping MBTiles creation (--skip-mbtiles)")
             return []
             
         if self.dry_run:
-            print("[DRY RUN] Would create MBTiles files and convert to PBF")
+            print("[DRY RUN] Would create MBTiles files")
             return []
             
-        print("\n[STEP 4] Creating MBTiles and Converting to PBF")
+        print("\n[STEP 4] Creating MBTiles")
         print("-" * 40)
         
         mbtiles_files = []
-        pbf_layers = []
         successful = 0
         
-        for geojson_file in tqdm(geojson_files, desc="Creating MBTiles and PBF"):
+        for geojson_file in tqdm(geojson_files, desc="Creating MBTiles"):
             # Extract year and month from filename
             filename = os.path.basename(geojson_file)
             parts = filename.replace('_land.geojson', '').split('_')
@@ -466,20 +376,12 @@ class HumidityProcessor:
             
             if self.geojson_to_mbtiles_tippecanoe(geojson_file, output_mbtiles):
                 mbtiles_files.append(output_mbtiles)
-                
-                # Convert MBTiles to PBF and upload to S3
-                layer_name = f"humidity_{month}_{year}_land"
-                if self.mbtiles_to_pbf_and_upload(output_mbtiles):
-                    pbf_layers.append(layer_name)
-                    successful += 1
-                else:
-                    print(f"⚠️ Failed to convert/upload PBF for {layer_name}")
+                successful += 1
         
         if self.verbose:
-            print(f"✅ Created {successful}/{len(geojson_files)} MBTiles and PBF layers")
-            print(f"📦 PBF layers: {pbf_layers}")
+            print(f"✅ Created {successful}/{len(geojson_files)} MBTiles")
         
-        return mbtiles_files, pbf_layers
+        return mbtiles_files
 
     def run_complete_pipeline(self):
         """Run the complete humidity processing pipeline"""
@@ -511,8 +413,8 @@ class HumidityProcessor:
         # Step 3: Create GeoJSON files
         geojson_files = self.create_geojsons(monthly_files)
         
-        # Step 4: Create MBTiles and convert to PBF
-        mbtiles_files, pbf_layers = self.create_mbtiles(geojson_files)
+        # Step 4: Create MBTiles
+        mbtiles_files = self.create_mbtiles(geojson_files)
         
         # Summary
         elapsed = time.time() - start_time
@@ -522,12 +424,11 @@ class HumidityProcessor:
         print(f"📊 Processed {len(monthly_files)} monthly datasets")
         print(f"🗺️ Created {len(geojson_files)} GeoJSON files")
         print(f"📦 Created {len(mbtiles_files)} MBTiles files")
-        print(f"🌐 Created {len(pbf_layers)} PBF layers in S3")
         print("\n📋 Next steps:")
-        print("1. PBF tiles are automatically uploaded to S3")
-        print("2. CloudFront will serve the tiles globally")
-        print("3. Access tiles via CloudFront URL for web applications")
-        print("\n💡 Workflow: CSV → Land Filtering → GeoJSON → MBTiles → PBF → S3 → CloudFront")
+        print("1. MBTiles are ready for visualization")
+        print("2. Use with tileserver-gl or similar for web applications")
+        print("3. Files are available in the output directory")
+        print("\n💡 Workflow: CSV → Land Filtering → GeoJSON → MBTiles")
         
         return True
 

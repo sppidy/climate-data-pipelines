@@ -1,0 +1,32 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment variables
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+/tmp/
+*.tmp
+*.log
+
+# Data directories (adjust as needed)
+*_data_output/
+*_mbtiles_output/
+processed-data/
+
+# Test files
+test_*.py
+*_test.py
