@@ -164,7 +164,7 @@ class PipelineManager:
             return False
     
     def sync_to_s3(self, data_type):
-        """Sync processed data to S3 (PBF tiles are already uploaded by pipeline)"""
+        """Sync processed data to S3"""
         if self.skip_s3_sync:
             logger.info(f"Skipping S3 sync for {data_type} (--skip-s3-sync)")
             return True
@@ -192,8 +192,8 @@ class PipelineManager:
             if not local_path:
                 logger.warning(f"No output directory found for {data_type}")
                 logger.info(f"Checked paths: {[str(p) for p in possible_paths]}")
-                # Note: PBF tiles are already uploaded by the pipeline, so this is not a failure
-                logger.info(f"PBF tiles for {data_type} are automatically uploaded during pipeline execution")
+                # Note: Some pipelines generate data in different locations
+                logger.info(f"Data for {data_type} may be available in other formats or locations")
                 return True
             
             s3_path = f"s3://{CLIMATE_DATA_BUCKET}/processed-data/{data_type}"
