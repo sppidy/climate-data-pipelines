@@ -1,19 +1,7 @@
 #!/usr/bin/env python3
 """
-Humidity (RH2M) Data Processing Pipeline
-Similar to precipitation workflow but for NASA POWER humidity data
-
-This script:
-1. Downloads NASA POWER RH2M (Relative Humidity at 2 Meters) data
-2. Filters for land points only (excludes ocean areas)
-3. Processes CSV data into monthly GeoJSON files with polygon grid cells
-4. Generates MBTiles for web visualization using tippecanoe
-5. Creates a complete tile server workflow
-
-Workflow: CSV → Land Filtering → Monthly GeoJSON (Polygons) → Monthly MBTiles
-
-Author: Generated for IITM Internship Project
-Date: June 2025
+NASA POWER RH2M Humidity Data Processing Pipeline
+CLI-compatible | Land-Only | MBTiles | TileServer Config | No HTML Viewer
 """
 
 import xarray as xr
@@ -23,508 +11,358 @@ import os
 import time
 import traceback
 import subprocess
-import argparse
-import sys
+import shutil
 from pathlib import Path
 from tqdm import tqdm
 import json
-from shapely.geometry import Polygon
-import geopandas as gpd
 from global_land_mask import globe
-
-# Import pipeline configuration
-try:
-    from pipeline_config import CLIMATE_DATA_BUCKET
-except ImportError:
-    # Fallback configuration
-    CLIMATE_DATA_BUCKET = "climate-data-dev-climate-data-b856a7c3"
+import argparse
 
 class HumidityProcessor:
-    def __init__(self, start_year=2022, start_month=1, end_year=2025, end_month=5, 
-                 output_dir="humidity_data_output", mbtiles_dir="humidity_mbtiles_output",
-                 skip_download=False, skip_geojson=False, skip_mbtiles=False,
-                 verbose=False, dry_run=False):
-        # Configuration
+    def __init__(self):
         self.ZARR_URL = "s3://nasa-power/merra2/temporal/power_merra2_monthly_temporal_utc.zarr"
         self.VARIABLE = "RH2M"
-        self.OUTPUT_DIR = output_dir
-        self.MBTILES_DIR = mbtiles_dir
-        
-        # Processing options
-        self.start_year = start_year
-        self.start_month = start_month
-        self.end_year = end_year
-        self.end_month = end_month
-        self.skip_download = skip_download
-        self.skip_geojson = skip_geojson
-        self.skip_mbtiles = skip_mbtiles
-        self.verbose = verbose
-        self.dry_run = dry_run
-        
-        # Create directories
-        if not self.dry_run:
-            for directory in [self.OUTPUT_DIR, self.MBTILES_DIR]:
-                os.makedirs(directory, exist_ok=True)
-        
-        if self.verbose:
-            print("🌡️ Humidity (RH2M) Data Processing Pipeline")
-            print(f"📅 Processing data from {self.start_year}-{self.start_month:02d} to {self.end_year}-{self.end_month:02d}")
-            print(f"📁 Output directory: {self.OUTPUT_DIR}")
-            print(f"📦 MBTiles directory: {self.MBTILES_DIR}")
-            print("=" * 60)
+        self.OUTPUT_DIR = "humidity_data_output"
+        self.MBTILES_DIR = "humidity_mbtiles_output"
+        self.start_year = 2022
+        self.start_month = 1
+        self.end_year = 2025
+        self.end_month = 5
+
+    def check_tippecanoe_installation(self):
+        """Check if tippecanoe is installed and accessible"""
+        try:
+            result = subprocess.run(['tippecanoe', '--version'], 
+                                  capture_output=True, text=True, timeout=10)
+            if result.returncode == 0:
+                print(f"✅ Tippecanoe found: {result.stdout.strip()}")
+                return True
+            else:
+                print("❌ Tippecanoe not working properly")
+                return False
+        except FileNotFoundError:
+            print("❌ Tippecanoe not found. Install with: brew install tippecanoe (macOS) or apt-get install tippecanoe (Ubuntu)")
+            return False
+        except subprocess.TimeoutExpired:
+            print("❌ Tippecanoe version check timed out")
+            return False
 
     def time_filter(self, t):
-        """Filter for dates from start_year/start_month to end_year/end_month"""
-        start_condition = (t.year > self.start_year) | ((t.year == self.start_year) & (t.month >= self.start_month))
-        end_condition = (t.year < self.end_year) | ((t.year == self.end_year) & (t.month <= self.end_month))
-        return start_condition & end_condition
+        start = (t.year > self.start_year) | ((t.year == self.start_year) & (t.month >= self.start_month))
+        end = (t.year < self.end_year) | ((t.year == self.end_year) & (t.month <= self.end_month))
+        return start & end
 
     def download_humidity_data(self):
-        """Download humidity data from NASA POWER Zarr store"""
-        if self.dry_run:
-            print("[DRY RUN] Would download humidity data")
-            return None
-            
         print("\n[STEP 1] Downloading NASA POWER RH2M Data")
-        print("-" * 40)
-        
         try:
-            if self.verbose:
-                print("📡 Opening remote Zarr store...")
             ds = xr.open_dataset(
                 self.ZARR_URL,
                 engine="zarr",
-                backend_kwargs={
-                    "consolidated": True,
-                    "storage_options": {"anon": True},
-                },
+                backend_kwargs={"consolidated": True, "storage_options": {"anon": True}},
             )
-            if self.verbose:
-                print("✅ Remote Zarr store opened successfully")
-            
-            # Filter time
-            if self.verbose:
-                print("📅 Filtering time range...")
             all_times = pd.to_datetime(ds.time.values)
             filtered_times = all_times[self.time_filter(all_times)]
-            
             if filtered_times.empty:
                 raise ValueError("No matching data found for specified date range")
-            
-            if self.verbose:
-                print(f"✅ Found {len(filtered_times)} monthly timestamps")
-            
-            # Extract data
-            if self.verbose:
-                print("💾 Extracting humidity data...")
+
             da_subset = ds[self.VARIABLE].sel(time=filtered_times)
             df = da_subset.to_dataframe().reset_index()
-            
-            # Clean data
-            if self.verbose:
-                print("🧹 Cleaning data (removing NaNs)...")
-            before = len(df)
             df = df.dropna(subset=[self.VARIABLE])
-            after = len(df)
-            if self.verbose:
-                print(f"✅ Cleaned data: {before} → {after} rows ({before-after} NaNs removed)")
-            
-            # Save main CSV
-            main_csv = os.path.join(self.OUTPUT_DIR, f"{self.VARIABLE}_monthly_{self.start_year}_{self.end_year}.csv")
-            df.to_csv(main_csv, index=False)
-            if self.verbose:
-                print(f"💾 Saved main dataset: {main_csv}")
-            
+
+            os.makedirs(self.OUTPUT_DIR, exist_ok=True)
+            csv_path = os.path.join(self.OUTPUT_DIR, f"{self.VARIABLE}_monthly_{self.start_year}_{self.end_year}.csv")
+            df.to_csv(csv_path, index=False)
+            print(f"✅ Saved main dataset: {csv_path}")
             return df
-            
         except Exception as e:
-            print(f"❌ Error downloading data: {e}")
-            if self.verbose:
-                traceback.print_exc()
+            print(f"❌ Error: {e}")
+            traceback.print_exc()
             return None
 
     def split_monthly_data(self, df):
-        """Split the main dataframe into monthly CSV files"""
-        if self.dry_run:
-            print("[DRY RUN] Would split data into monthly files")
-            return []
-            
-        print("\n[STEP 2] Splitting into Monthly Files")
-        print("-" * 40)
-        
-        monthly_files = []
-        
-        # Group by year and month
         df['year'] = pd.to_datetime(df['time']).dt.year
         df['month'] = pd.to_datetime(df['time']).dt.month
-        
-        for (year, month), group in tqdm(df.groupby(['year', 'month']), desc="Creating monthly files"):
+        monthly_files = []
+
+        for (year, month), group in df.groupby(['year', 'month']):
             filename = f"humidity_{month:02d}_{year}.csv"
             filepath = os.path.join(self.OUTPUT_DIR, filename)
-            
-            # Save monthly data
-            monthly_data = group[['time', 'lat', 'lon', self.VARIABLE]].copy()
-            monthly_data.to_csv(filepath, index=False)
+            group[['time', 'lat', 'lon', self.VARIABLE]].to_csv(filepath, index=False)
             monthly_files.append(filepath)
-        
-        if self.verbose:
-            print(f"✅ Created {len(monthly_files)} monthly CSV files")
+
         return monthly_files
 
-    def csv_to_geojson(self, csv_file, output_geojson):
-        """Convert CSV humidity data to GeoJSON with polygon grid cells (land only)"""
+    def validate_geojson(self, geojson_file):
+        """Validate GeoJSON file has features"""
         try:
-            # Read CSV
+            with open(geojson_file, 'r') as f:
+                geojson = json.load(f)
+            
+            features = geojson.get('features', [])
+            if not features:
+                print(f"❌ No features in {geojson_file}")
+                return False
+            
+            print(f"✅ {geojson_file} has {len(features)} features")
+            return True
+        except Exception as e:
+            print(f"❌ Invalid GeoJSON {geojson_file}: {e}")
+            return False
+
+    def csv_to_geojson(self, csv_file, output_geojson):
+        try:
             df = pd.read_csv(csv_file)
+            print(f"📊 Processing {csv_file}: {len(df)} rows")
             
             if df.empty:
-                if self.verbose:
-                    print(f"⚠️ Empty CSV file: {csv_file}")
+                print(f"❌ Empty CSV: {csv_file}")
                 return False
-            
-            if self.verbose:
-                print(f"📊 Initial data points: {len(df)}")
-            
-            # Filter for land points only
-            if self.verbose:
-                print("🌍 Filtering for land points only...")
+
+            # Apply land mask
             land_mask = globe.is_land(df['lat'].values, df['lon'].values)
             df_land = df[land_mask].copy()
+            print(f"🌍 Land points: {len(df_land)} out of {len(df)}")
             
             if df_land.empty:
-                if self.verbose:
-                    print(f"⚠️ No land points found in {csv_file}")
+                print(f"❌ No land points in {csv_file}")
                 return False
-            
-            if self.verbose:
-                print(f"🏞️ Land points: {len(df_land)} ({len(df_land)/len(df)*100:.1f}% of total)")
-            
-            # Get unique coordinates to determine grid resolution
-            unique_lats = sorted(df_land['lat'].unique().tolist())
-            unique_lons = sorted(df_land['lon'].unique().tolist())
-            
-            # Calculate grid cell size (assuming regular grid)
-            if len(unique_lats) > 1:
-                lat_res = abs(unique_lats[1] - unique_lats[0])
-            else:
-                lat_res = 0.5  # Default resolution
-                
-            if len(unique_lons) > 1:
-                lon_res = abs(unique_lons[1] - unique_lons[0])
-            else:
-                lon_res = 0.625  # Default resolution
-            
-            if self.verbose:
-                print(f"📐 Grid resolution: {lat_res}° lat × {lon_res}° lon")
-            
-            # Create polygon features for land points only
+
+            # Remove any remaining NaN values
+            df_land = df_land.dropna(subset=[self.VARIABLE])
+            if df_land.empty:
+                print(f"❌ No valid humidity data after NaN removal in {csv_file}")
+                return False
+
+            unique_lats = sorted(df_land['lat'].unique())
+            unique_lons = sorted(df_land['lon'].unique())
+            lat_res = abs(unique_lats[1] - unique_lats[0]) if len(unique_lats) > 1 else 0.5
+            lon_res = abs(unique_lons[1] - unique_lons[0]) if len(unique_lons) > 1 else 0.625
+
             features = []
             for _, row in df_land.iterrows():
-                lat = float(row['lat'])
-                lon = float(row['lon'])
-                humidity = row[self.VARIABLE]
-                
-                # Skip NaN values
-                if pd.isna(humidity):
+                lat, lon, humidity = row['lat'], row['lon'], row[self.VARIABLE]
+                if pd.isna(humidity): 
                     continue
-                
-                # Create polygon for grid cell (centered on lat/lon)
-                half_lat = lat_res / 2
-                half_lon = lon_res / 2
-                
-                # Define polygon coordinates (rectangle)
+                    
+                half_lat, half_lon = lat_res / 2, lon_res / 2
                 coordinates = [[
-                    [lon - half_lon, lat - half_lat],  # SW corner
-                    [lon + half_lon, lat - half_lat],  # SE corner
-                    [lon + half_lon, lat + half_lat],  # NE corner
-                    [lon - half_lon, lat + half_lat],  # NW corner
-                    [lon - half_lon, lat - half_lat]   # Close polygon
+                    [lon - half_lon, lat - half_lat],
+                    [lon + half_lon, lat - half_lat],
+                    [lon + half_lon, lat + half_lat],
+                    [lon - half_lon, lat + half_lat],
+                    [lon - half_lon, lat - half_lat]
                 ]]
-                
-                feature = {
+                features.append({
                     "type": "Feature",
-                    "geometry": {
-                        "type": "Polygon",
-                        "coordinates": coordinates
-                    },
+                    "geometry": {"type": "Polygon", "coordinates": coordinates},
                     "properties": {
-                        "humidity": float(humidity),
-                        "lat": lat,
-                        "lon": lon,
-                        "time": str(row['time'])
+                        "humidity": float(humidity),  # Ensure numeric
+                        "time": str(row['time']),
+                        "lat": float(lat),
+                        "lon": float(lon)
                     }
-                }
-                features.append(feature)
-            
-            # Create GeoJSON structure
-            geojson = {
-                "type": "FeatureCollection",
-                "features": features
-            }
-            
-            # Save GeoJSON
+                })
+
+            if not features:
+                print(f"❌ No valid features generated for {csv_file}")
+                return False
+
+            geojson = {"type": "FeatureCollection", "features": features}
             with open(output_geojson, 'w') as f:
-                json.dump(geojson, f, indent=2)
+                json.dump(geojson, f, separators=(',', ':'))  # Compact JSON
             
-            if self.verbose:
-                print(f"✅ Created GeoJSON: {output_geojson} ({len(features)} features)")
+            print(f"✅ Created GeoJSON: {output_geojson} with {len(features)} features")
             return True
             
         except Exception as e:
-            print(f"❌ Error converting {csv_file} to GeoJSON: {e}")
-            if self.verbose:
-                traceback.print_exc()
+            print(f"❌ GeoJSON error for {csv_file}: {e}")
+            traceback.print_exc()
             return False
 
-    def geojson_to_mbtiles_tippecanoe(self, geojson_file, output_mbtiles):
-        """Convert GeoJSON to MBTiles using tippecanoe"""
+    def geojson_to_mbtiles_tippecanoe(self, geojson_file, output_mbtiles, zoom_min=0, zoom_max=10):
         try:
-            if self.verbose:
-                print(f"🔧 Converting {geojson_file} to MBTiles...")
+            # Check if tippecanoe is available
+            if not self.check_tippecanoe_installation():
+                return False
+                
+            # Validate input file
+            if not self.validate_geojson(geojson_file):
+                return False
             
-            # Tippecanoe command with optimized settings for climate data
+            # Remove existing mbtiles file if it exists
+            if os.path.exists(output_mbtiles):
+                os.remove(output_mbtiles)
+                print(f"🗑️  Removed existing: {output_mbtiles}")
+            
+            # Create output directory if it doesn't exist
+            os.makedirs(os.path.dirname(output_mbtiles), exist_ok=True)
+            
+            # Build tippecanoe command with better options
             cmd = [
-                "tippecanoe",
-                "-o", output_mbtiles,
-                "-zg",  # Automatically determine zoom levels
-                "--drop-densest-as-needed",
-                "--extend-zooms-if-still-dropping",
-                "--simplification=10",
-                "--buffer=64",
-                "--accumulate-attribute=humidity:mean",
+                'tippecanoe',
+                '-o', output_mbtiles,
+                '-z', str(zoom_max),
+                '-Z', str(zoom_min),
+                '--no-feature-limit',
+                '--no-tile-size-limit',
+                '--drop-densest-as-needed',
+                '--extend-zooms-if-still-dropping',
+                '--force',
+                '--quiet',  # Reduce output noise
                 geojson_file
             ]
             
-            if self.verbose:
-                print(f"Running: {' '.join(cmd)}")
+            print(f"🔧 Running: {' '.join(cmd)}")
             
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            # Run tippecanoe with better error handling
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
             
             if result.returncode == 0:
-                if self.verbose:
-                    print(f"✅ Created MBTiles: {output_mbtiles}")
-                return True
+                # Verify output file was created
+                if os.path.exists(output_mbtiles) and os.path.getsize(output_mbtiles) > 0:
+                    file_size = os.path.getsize(output_mbtiles) / 1024 / 1024  # MB
+                    print(f"✅ Created MBTiles: {output_mbtiles} ({file_size:.1f} MB)")
+                    return True
+                else:
+                    print(f"❌ MBTiles file not created or empty: {output_mbtiles}")
+                    return False
             else:
-                print(f"❌ Tippecanoe failed: {result.stderr}")
+                print(f"❌ Tippecanoe failed with return code {result.returncode}")
+                if result.stdout:
+                    print(f"   STDOUT: {result.stdout}")
+                if result.stderr:
+                    print(f"   STDERR: {result.stderr}")
                 return False
                 
+        except subprocess.TimeoutExpired:
+            print(f"❌ Tippecanoe timed out after 30 minutes")
+            return False
         except Exception as e:
-            print(f"❌ Error creating MBTiles: {e}")
-            if self.verbose:
-                traceback.print_exc()
+            print(f"❌ Tippecanoe error: {e}")
+            traceback.print_exc()
             return False
 
     def create_geojsons(self, monthly_files):
-        """Create GeoJSON files from monthly CSV files"""
-        if self.skip_geojson:
-            print("\n[STEP 3] Skipping GeoJSON creation (--skip-geojson)")
-            return []
-            
-        if self.dry_run:
-            print("[DRY RUN] Would create GeoJSON files")
-            return []
-            
-        print("\n[STEP 3] Creating GeoJSON Files")
-        print("-" * 40)
-        
+        print(f"\n[STEP 2] Creating GeoJSON files for {len(monthly_files)} monthly files")
         geojson_files = []
-        successful = 0
         
-        for csv_file in tqdm(monthly_files, desc="Converting to GeoJSON"):
-            # Extract year and month from filename
-            filename = os.path.basename(csv_file)
-            parts = filename.replace('.csv', '').split('_')
-            month = parts[1]
-            year = parts[2]
+        for i, csv_file in enumerate(monthly_files, 1):
+            base_name = os.path.basename(csv_file).replace('.csv', '')
+            geojson_file = os.path.join(self.OUTPUT_DIR, f"{base_name}_land.geojson")
             
-            output_geojson = os.path.join(self.OUTPUT_DIR, f"humidity_{month}_{year}_land.geojson")
+            print(f"📋 [{i}/{len(monthly_files)}] Processing: {csv_file}")
             
-            if self.csv_to_geojson(csv_file, output_geojson):
-                geojson_files.append(output_geojson)
-                successful += 1
+            if self.csv_to_geojson(csv_file, geojson_file):
+                geojson_files.append(geojson_file)
+            else:
+                print(f"⚠️  Skipped: {csv_file}")
         
-        if self.verbose:
-            print(f"✅ Created {successful}/{len(monthly_files)} GeoJSON files")
+        print(f"✅ Created {len(geojson_files)} GeoJSON files")
         return geojson_files
 
-
-
-    def create_mbtiles(self, geojson_files):
-        """Create MBTiles from GeoJSON files"""
-        if self.skip_mbtiles:
-            print("\n[STEP 4] Skipping MBTiles creation (--skip-mbtiles)")
-            return []
-            
-        if self.dry_run:
-            print("[DRY RUN] Would create MBTiles files")
-            return []
-            
-        print("\n[STEP 4] Creating MBTiles")
-        print("-" * 40)
-        
+    def create_mbtiles(self, geojson_files, zoom_min=0, zoom_max=10):
+        print(f"\n[STEP 3] Creating MBTiles for {len(geojson_files)} GeoJSON files")
         mbtiles_files = []
-        successful = 0
         
-        for geojson_file in tqdm(geojson_files, desc="Creating MBTiles"):
-            # Extract year and month from filename
-            filename = os.path.basename(geojson_file)
-            parts = filename.replace('_land.geojson', '').split('_')
-            month = parts[1]
-            year = parts[2]
+        for i, geojson_file in enumerate(geojson_files, 1):
+            base_name = os.path.basename(geojson_file).replace('_land.geojson', '')
+            mbtiles_file = os.path.join(self.MBTILES_DIR, f"{base_name}_land.mbtiles")
             
-            output_mbtiles = os.path.join(self.MBTILES_DIR, f"humidity_{month}_{year}_land.mbtiles")
+            print(f"🗺️  [{i}/{len(geojson_files)}] Processing: {geojson_file}")
             
-            if self.geojson_to_mbtiles_tippecanoe(geojson_file, output_mbtiles):
-                mbtiles_files.append(output_mbtiles)
-                successful += 1
+            if self.geojson_to_mbtiles_tippecanoe(geojson_file, mbtiles_file, zoom_min, zoom_max):
+                mbtiles_files.append(mbtiles_file)
+            else:
+                print(f"⚠️  Skipped: {geojson_file}")
         
-        if self.verbose:
-            print(f"✅ Created {successful}/{len(geojson_files)} MBTiles")
-        
+        print(f"✅ Created {len(mbtiles_files)} MBTiles files")
         return mbtiles_files
 
-    def run_complete_pipeline(self):
-        """Run the complete humidity processing pipeline"""
-        start_time = time.time()
+    def create_tileserver_config(self, mbtiles_files):
+        print(f"\n[STEP 4] Creating TileServer GL config")
+        config = {
+            "options": {
+                "paths": {"root": "", "mbtiles": f"./{self.MBTILES_DIR}"},
+                "serveStaticMaps": True,
+                "formatQuality": {"jpeg": 90, "webp": 90},
+                "maxSize": 8192
+            },
+            "data": {}
+        }
         
-        print("🚀 Starting Complete Humidity Processing Pipeline")
-        print("=" * 60)
+        for mbtiles_file in mbtiles_files:
+            base_name = os.path.basename(mbtiles_file).replace('_land.mbtiles', '')
+            config["data"][f"{base_name}_land"] = {
+                "mbtiles": os.path.basename(mbtiles_file)
+            }
         
-        # Step 1: Download data
-        if not self.skip_download:
-            df = self.download_humidity_data()
-            if df is None:
-                print("❌ Pipeline failed at data download step")
-                return False
-        else:
-            print("\n[STEP 1] Skipping data download (--skip-download)")
-            # Try to find existing CSV file
-            main_csv = os.path.join(self.OUTPUT_DIR, f"{self.VARIABLE}_monthly_{self.start_year}_{self.end_year}.csv")
-            if os.path.exists(main_csv):
-                df = pd.read_csv(main_csv)
-                print(f"✅ Using existing data: {main_csv}")
-            else:
-                print("❌ No existing data found and download is skipped")
-                return False
+        config_file = "humidity-tileserver-config.json"
+        with open(config_file, 'w') as f:
+            json.dump(config, f, indent=2)
         
-        # Step 2: Split into monthly files
-        monthly_files = self.split_monthly_data(df)
-        
-        # Step 3: Create GeoJSON files
-        geojson_files = self.create_geojsons(monthly_files)
-        
-        # Step 4: Create MBTiles
-        mbtiles_files = self.create_mbtiles(geojson_files)
-        
-        # Summary
-        elapsed = time.time() - start_time
-        print("\n" + "=" * 60)
-        print("🎉 PIPELINE COMPLETE!")
-        print(f"⏱️ Total execution time: {elapsed:.2f} seconds")
-        print(f"📊 Processed {len(monthly_files)} monthly datasets")
-        print(f"🗺️ Created {len(geojson_files)} GeoJSON files")
-        print(f"📦 Created {len(mbtiles_files)} MBTiles files")
-        print("\n📋 Next steps:")
-        print("1. MBTiles are ready for visualization")
-        print("2. Use with tileserver-gl or similar for web applications")
-        print("3. Files are available in the output directory")
-        print("\n💡 Workflow: CSV → Land Filtering → GeoJSON → MBTiles")
-        
-        return True
+        print(f"✅ Created tileserver config: {config_file}")
+        print(f"📋 Configured {len(mbtiles_files)} tilesets")
 
 def main():
-    """Main function with CLI argument parsing"""
-    parser = argparse.ArgumentParser(
-        description="Humidity (RH2M) Data Processing Pipeline",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Run complete pipeline with default settings
-  python humidity_pipeline.py
-
-  # Process specific date range
-  python humidity_pipeline.py --start-year 2023 --end-year 2024
-
-  # Skip certain steps (useful for resuming)
-  python humidity_pipeline.py --skip-download --skip-geojson
-
-  # Dry run to see what would be done
-  python humidity_pipeline.py --dry-run
-
-  # Verbose output
-  python humidity_pipeline.py --verbose
-
-  # Custom output directories
-  python humidity_pipeline.py --output-dir my_humidity_data --mbtiles-dir my_mbtiles
-        """
-    )
-    
-    # Date range options
-    parser.add_argument('--start-year', type=int, default=2022,
-                       help='Start year for data processing (default: 2022)')
-    parser.add_argument('--start-month', type=int, default=1,
-                       help='Start month for data processing (default: 1)')
-    parser.add_argument('--end-year', type=int, default=2025,
-                       help='End year for data processing (default: 2025)')
-    parser.add_argument('--end-month', type=int, default=5,
-                       help='End month for data processing (default: 5)')
-    
-    # Output options
-    parser.add_argument('--output-dir', default='humidity_data_output',
-                       help='Output directory for CSV and GeoJSON files (default: humidity_data_output)')
-    parser.add_argument('--mbtiles-dir', default='humidity_mbtiles_output',
-                       help='Output directory for MBTiles files (default: humidity_mbtiles_output)')
-    
-    # Processing options
-    parser.add_argument('--skip-download', action='store_true',
-                       help='Skip data download step (use existing CSV files)')
-    parser.add_argument('--skip-geojson', action='store_true',
-                       help='Skip GeoJSON creation step')
-    parser.add_argument('--skip-mbtiles', action='store_true',
-                       help='Skip MBTiles creation step')
-    
-    # Control options
-    parser.add_argument('--verbose', '-v', action='store_true',
-                       help='Enable verbose output')
-    parser.add_argument('--dry-run', action='store_true',
-                       help='Show what would be done without actually doing it')
-    
+    parser = argparse.ArgumentParser(description="NASA POWER RH2M Humidity Data CLI (Land-Only Tiles)")
+    parser.add_argument('--start-year', type=int, default=2022)
+    parser.add_argument('--start-month', type=int, default=1)
+    parser.add_argument('--end-year', type=int, default=2025)
+    parser.add_argument('--end-month', type=int, default=5)
+    parser.add_argument('--output-dir', type=str, default='humidity_data_output')
+    parser.add_argument('--mbtiles-dir', type=str, default='humidity_mbtiles_output')
+    parser.add_argument('--zoom-min', type=int, default=0)
+    parser.add_argument('--zoom-max', type=int, default=10)
+    parser.add_argument('--skip-download', action='store_true')
+    parser.add_argument('--skip-geojson', action='store_true')
+    parser.add_argument('--skip-mbtiles', action='store_true')
     args = parser.parse_args()
+
+    processor = HumidityProcessor()
+    processor.start_year = args.start_year
+    processor.start_month = args.start_month
+    processor.end_year = args.end_year
+    processor.end_month = args.end_month
+    processor.OUTPUT_DIR = args.output_dir
+    processor.MBTILES_DIR = args.mbtiles_dir
+
+    # Create directories
+    os.makedirs(processor.OUTPUT_DIR, exist_ok=True)
+    os.makedirs(processor.MBTILES_DIR, exist_ok=True)
+
+    # Check tippecanoe installation early
+    if not args.skip_mbtiles:
+        if not processor.check_tippecanoe_installation():
+            print("❌ Cannot proceed without tippecanoe. Install it or use --skip-mbtiles")
+            return
+
+    # Download or load data
+    df = None
+    if not args.skip_download:
+        df = processor.download_humidity_data()
+        if df is None:
+            print("❌ Download failed.")
+            return
+    else:
+        csv_path = os.path.join(processor.OUTPUT_DIR, f"{processor.VARIABLE}_monthly_{processor.start_year}_{processor.end_year}.csv")
+        if not os.path.exists(csv_path):
+            print(f"❌ CSV file not found: {csv_path}")
+            return
+        df = pd.read_csv(csv_path)
+
+    # Process data
+    monthly_files = processor.split_monthly_data(df)
+    print(f"📊 Split into {len(monthly_files)} monthly files")
+
+    geojson_files = [] if args.skip_geojson else processor.create_geojsons(monthly_files)
+    mbtiles_files = [] if args.skip_mbtiles else processor.create_mbtiles(geojson_files, args.zoom_min, args.zoom_max)
     
-    # Validate arguments
-    if args.start_year > args.end_year:
-        print("❌ Error: start_year cannot be greater than end_year")
-        sys.exit(1)
-    
-    if args.start_year == args.end_year and args.start_month > args.end_month:
-        print("❌ Error: start_month cannot be greater than end_month when start_year equals end_year")
-        sys.exit(1)
-    
-    if not (1 <= args.start_month <= 12):
-        print("❌ Error: start_month must be between 1 and 12")
-        sys.exit(1)
-    
-    if not (1 <= args.end_month <= 12):
-        print("❌ Error: end_month must be between 1 and 12")
-        sys.exit(1)
-    
-    # Create processor and run pipeline
-    processor = HumidityProcessor(
-        start_year=args.start_year,
-        start_month=args.start_month,
-        end_year=args.end_year,
-        end_month=args.end_month,
-        output_dir=args.output_dir,
-        mbtiles_dir=args.mbtiles_dir,
-        skip_download=args.skip_download,
-        skip_geojson=args.skip_geojson,
-        skip_mbtiles=args.skip_mbtiles,
-        verbose=args.verbose,
-        dry_run=args.dry_run
-    )
-    
-    success = processor.run_complete_pipeline()
-    sys.exit(0 if success else 1)
+    processor.create_tileserver_config(mbtiles_files)
+
+    print("\n🎉 CLI Pipeline Complete!")
+    print(f"📁 Data files: {processor.OUTPUT_DIR}")
+    print(f"🗺️  MBTiles: {processor.MBTILES_DIR}")
+    print(f"⚙️  Config: humidity-tileserver-config.json")
 
 if __name__ == "__main__":
     main()

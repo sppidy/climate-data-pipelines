@@ -1,725 +1,209 @@
 #!/usr/bin/env python3
 """
-Temperature (T2M) Data Processing Pipeline
-Similar to precipitation workflow but for NASA POWER temperature data
+Temperature (T2M) Data Processing Pipeline CLI
 
-This script:
-1. Downloads NASA POWER T2M (Temperature at 2 Meters) data
-2. Filters for land points only (excludes ocean areas)
-3. Processes CSV data into monthly GeoJSON files with polygon grid cells
-4. Generates MBTiles for web visualization using tippecanoe
-5. Creates a complete tile server workflow
+Features:
+- Downloads NASA POWER T2M data
+- Filters for land points only
+- Processes CSV to monthly GeoJSON
+- Generates MBTiles via tippecanoe
+- Produces TileServer-GL config (no HTML viewer)
 
-Workflow: CSV → Land Filtering → Monthly GeoJSON (Polygons) → Monthly MBTiles
+CLI Flags:
+--start-year, --start-month, --end-year, --end-month
+--output-dir, --mbtiles-dir
+--zoom-min, --zoom-max
+--skip-download, --skip-geojson, --skip-mbtiles
 
-Author: Generated for IITM Internship Project
-Date: June 2025
+Author: Adapted for IITM Internship Project
+Date: July 2025
 """
-
 import xarray as xr
 import pandas as pd
-import numpy as np
 import os
 import time
 import traceback
 import subprocess
+import json
 import argparse
-import sys
 from pathlib import Path
 from tqdm import tqdm
-import json
-from shapely.geometry import Polygon
-import geopandas as gpd
 from global_land_mask import globe
 
-# Import pipeline configuration
-try:
-    from pipeline_config import CLIMATE_DATA_BUCKET
-except ImportError:
-    # Fallback configuration
-    CLIMATE_DATA_BUCKET = "climate-data-dev-climate-data-b856a7c3"
-
 class TemperatureProcessor:
-    def __init__(self, start_year=2022, start_month=1, end_year=2025, end_month=5, 
-                 output_dir="temperature_data_output", mbtiles_dir="temperature_mbtiles_output",
-                 variable="T2M"):
-        # Configuration
+    def __init__(self, args):
         self.ZARR_URL = "s3://nasa-power/merra2/temporal/power_merra2_monthly_temporal_utc.zarr"
-        self.VARIABLE = variable
-        self.OUTPUT_DIR = output_dir
-        self.MBTILES_DIR = mbtiles_dir
-        
-        # Create directories
-        for directory in [self.OUTPUT_DIR, self.MBTILES_DIR]:
-            os.makedirs(directory, exist_ok=True)
-        
-        # Date range (configurable)
-        self.start_year = start_year
-        self.start_month = start_month
-        self.end_year = end_year
-        self.end_month = end_month
-        
-        print("🌡️ Temperature (T2M) Data Processing Pipeline")
-        print(f"📅 Processing data from {start_year:04d}-{start_month:02d} to {end_year:04d}-{end_month:02d}")
-        print("=" * 60)
+        self.VARIABLE = "T2M"
+        self.PREFIX = "temperature"
+        self.start_year = args.start_year
+        self.start_month = args.start_month
+        self.end_year = args.end_year
+        self.end_month = args.end_month
+        self.OUTPUT_DIR = args.output_dir
+        self.MBTILES_DIR = args.mbtiles_dir
+        self.zoom_min = args.zoom_min
+        self.zoom_max = args.zoom_max
 
-    def time_filter(self, t):
-        """Filter for dates within the specified year and month range"""
-        start_condition = (t.year > self.start_year) | ((t.year == self.start_year) & (t.month >= self.start_month))
-        end_condition = (t.year < self.end_year) | ((t.year == self.end_year) & (t.month <= self.end_month))
-        return start_condition & end_condition
+        os.makedirs(self.OUTPUT_DIR, exist_ok=True)
+        os.makedirs(self.MBTILES_DIR, exist_ok=True)
 
-    def download_temperature_data(self):
-        """Download temperature data from NASA POWER Zarr store"""
-        print("\n[STEP 1] Downloading NASA POWER T2M Data")
-        print("-" * 40)
-        
+    def check_tippecanoe(self):
         try:
-            print("📡 Opening remote Zarr store...")
+            res = subprocess.run(['tippecanoe','--version'], capture_output=True, text=True, timeout=10)
+            return res.returncode == 0
+        except Exception:
+            return False
+
+    def time_filter(self, times):
+        start = (times.year > self.start_year) | ((times.year == self.start_year) & (times.month >= self.start_month))
+        end = (times.year < self.end_year) | ((times.year == self.end_year) & (times.month <= self.end_month))
+        return start & end
+
+    def download_data(self):
+        print("[STEP 1] Downloading T2M data...")
+        try:
             ds = xr.open_dataset(
                 self.ZARR_URL,
-                engine="zarr",
-                backend_kwargs={
-                    "consolidated": True,
-                    "storage_options": {"anon": True},
-                },
+                engine='zarr',
+                backend_kwargs={'consolidated':True,'storage_options':{'anon':True}}
             )
-            print("✅ Remote Zarr store opened successfully")
-            
-            # Filter time
-            print("📅 Filtering time range...")
-            all_times = pd.to_datetime(ds.time.values)
-            filtered_times = all_times[self.time_filter(all_times)]
-            
-            if filtered_times.empty:
-                raise ValueError("No matching data found for specified date range")
-            
-            print(f"✅ Found {len(filtered_times)} monthly timestamps")
-            
-            # Extract data
-            print("💾 Extracting temperature data...")
-            da_subset = ds[self.VARIABLE].sel(time=filtered_times)
-            df = da_subset.to_dataframe().reset_index()
-            
-            # Clean data
-            print("🧹 Cleaning data (removing NaNs)...")
-            before = len(df)
-            df = df.dropna(subset=[self.VARIABLE])
-            after = len(df)
-            print(f"✅ Cleaned data: {before} → {after} rows ({before-after} NaNs removed)")
-            
-            # Save main CSV
-            main_csv = os.path.join(self.OUTPUT_DIR, f"{self.VARIABLE}_monthly_{self.start_year}_{self.end_year}.csv")
-            df.to_csv(main_csv, index=False)
-            print(f"💾 Saved main dataset: {main_csv}")
-            
+            times = pd.to_datetime(ds.time.values)
+            filt = times[self.time_filter(times)]
+            da = ds[self.VARIABLE].sel(time=filt)
+            df = da.to_dataframe().reset_index().dropna(subset=[self.VARIABLE])
+            csv_path = os.path.join(self.OUTPUT_DIR, f"{self.PREFIX}_monthly_{self.start_year}_{self.end_year}.csv")
+            df.to_csv(csv_path, index=False)
+            print(f"Saved CSV: {csv_path}")
             return df
-            
         except Exception as e:
-            print(f"❌ Error downloading data: {e}")
+            print(f"Download error: {e}")
             traceback.print_exc()
             return None
 
-    def split_monthly_data(self, df):
-        """Split the main dataframe into monthly CSV files"""
-        print("\n[STEP 2] Splitting into Monthly Files")
-        print("-" * 40)
-        
-        monthly_files = []
-        
-        # Group by year and month
+    def split_monthly(self, df):
+        print("[STEP 2] Splitting monthly CSVs...")
         df['year'] = pd.to_datetime(df['time']).dt.year
         df['month'] = pd.to_datetime(df['time']).dt.month
-        
-        for (year, month), group in tqdm(df.groupby(['year', 'month']), desc="Creating monthly files"):
-            filename = f"temperature_{month:02d}_{year}.csv"
-            filepath = os.path.join(self.OUTPUT_DIR, filename)
-            
-            # Save monthly data
-            monthly_data = group[['time', 'lat', 'lon', self.VARIABLE]].copy()
-            monthly_data.to_csv(filepath, index=False)
-            monthly_files.append(filepath)
-        
-        print(f"✅ Created {len(monthly_files)} monthly CSV files")
-        return monthly_files
+        files = []
+        for (year, month), grp in tqdm(df.groupby(['year','month']), desc='Monthly files'):
+            filename = f"{self.PREFIX}_{month:02d}_{year}.csv"
+            path = os.path.join(self.OUTPUT_DIR, filename)
+            grp[['time','lat','lon',self.VARIABLE]].to_csv(path, index=False)
+            files.append(path)
+        return files
 
-    def csv_to_geojson(self, csv_file, output_geojson):
-        """Convert CSV temperature data to GeoJSON with polygon grid cells (land only)"""
-        try:
-            # Read CSV
-            df = pd.read_csv(csv_file)
-            
-            if df.empty:
-                print(f"⚠️ Empty CSV file: {csv_file}")
-                return False
-            
-            print(f"📊 Initial data points: {len(df)}")
-            
-            # Filter for land points only
-            print("🌍 Filtering for land points only...")
-            land_mask = globe.is_land(df['lat'].values, df['lon'].values)
-            df_land = df[land_mask].copy()
-            
-            if df_land.empty:
-                print(f"⚠️ No land points found in {csv_file}")
-                return False
-            
-            print(f"🏞️ Land points: {len(df_land)} ({len(df_land)/len(df)*100:.1f}% of total)")
-            
-            # Get unique coordinates to determine grid resolution
-            unique_lats = sorted(df_land['lat'].unique())
-            unique_lons = sorted(df_land['lon'].unique())
-            
-            # Calculate grid cell size (assuming regular grid)
-            if len(unique_lats) > 1:
-                lat_res = abs(unique_lats[1] - unique_lats[0])
-            else:
-                lat_res = 0.5  # Default resolution
-                
-            if len(unique_lons) > 1:
-                lon_res = abs(unique_lons[1] - unique_lons[0])
-            else:
-                lon_res = 0.625  # Default resolution
-            
-            print(f"📐 Grid resolution: {lat_res}° lat × {lon_res}° lon")
-            
-            # Create polygon features for land points only
-            features = []
-            for _, row in df_land.iterrows():
-                lat = row['lat']
-                lon = row['lon']
-                temperature = row[self.VARIABLE]
-                
-                # Skip NaN values
-                if pd.isna(temperature):
-                    continue
-                
-                # Create polygon for grid cell (centered on lat/lon)
-                half_lat = lat_res / 2
-                half_lon = lon_res / 2
-                
-                # Define polygon coordinates (rectangle)
-                coordinates = [[
-                    [lon - half_lon, lat - half_lat],  # SW corner
-                    [lon + half_lon, lat - half_lat],  # SE corner
-                    [lon + half_lon, lat + half_lat],  # NE corner
-                    [lon - half_lon, lat + half_lat],  # NW corner
-                    [lon - half_lon, lat - half_lat]   # Close polygon
-                ]]
-                
-                feature = {
-                    "type": "Feature",
-                    "geometry": {
-                        "type": "Polygon",
-                        "coordinates": coordinates
-                    },
-                    "properties": {
-                        "temperature": temperature,
-                        "time": row['time'],
-                        "lat": lat,
-                        "lon": lon
-                    }
-                }
-                features.append(feature)
-            
-            geojson = {
-                "type": "FeatureCollection",
-                "features": features
-            }
-            
-            # Save GeoJSON
-            with open(output_geojson, 'w') as f:
-                json.dump(geojson, f)
-            
-            print(f"✅ Created {len(features)} land polygon features")
-            return True
-            
-        except Exception as e:
-            print(f"❌ Error creating land-filtered GeoJSON polygons for {csv_file}: {e}")
+    def csv_to_geojson(self, csv_file, geojson_file):
+        df = pd.read_csv(csv_file)
+        mask = globe.is_land(df['lat'].values, df['lon'].values)
+        df_land = df[mask].dropna(subset=[self.VARIABLE])
+        if df_land.empty:
             return False
-
-    def geojson_to_mbtiles_tippecanoe(self, geojson_file, output_mbtiles):
-        """Convert GeoJSON polygons to MBTiles using tippecanoe"""
-        try:
-            # Use tippecanoe to convert GeoJSON to MBTiles (optimized for polygons)
-            cmd = [
-                'tippecanoe',
-                '-o', output_mbtiles,
-                '-z', '10',  # max zoom
-                '-Z', '0',   # min zoom
-                '--no-feature-limit',  # No limit on features per tile
-                '--no-tile-size-limit',  # No limit on tile size
-                '-B0',  # No tile buffer (good for grid cells)
-                '--drop-densest-as-needed',
-                '--extend-zooms-if-still-dropping',
-                '--force',  # Overwrite existing files
-                geojson_file
-            ]
-            
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode == 0:
-                return True
-            else:
-                print(f"⚠️ Tippecanoe failed: {result.stderr}")
-                return False
-                
-        except Exception as e:
-            print(f"❌ Error converting GeoJSON polygons to MBTiles: {e}")
-            return False
-
-    def create_geojsons(self, monthly_files):
-        """Create GeoJSON files from monthly CSV files"""
-        print("\n[STEP 3] Creating GeoJSON Files")
-        print("-" * 40)
-        
-        geojson_files = []
-        
-        for csv_file in tqdm(monthly_files, desc="Creating GeoJSONs"):
-            # Extract date from filename
-            base_name = os.path.basename(csv_file).replace('.csv', '')
-            geojson_file = os.path.join(self.OUTPUT_DIR, f"{base_name}_land.geojson")
-            
-            if self.csv_to_geojson(csv_file, geojson_file):
-                geojson_files.append(geojson_file)
-        
-        print(f"✅ Created {len(geojson_files)} GeoJSON files")
-        return geojson_files
-
-
-
-    def create_mbtiles(self, geojson_files):
-        """Create MBTiles from GeoJSON files"""
-        print("\n[STEP 4] Creating MBTiles")
-        print("-" * 40)
-        
-        mbtiles_files = []
-        successful = 0
-        
-        for geojson_file in tqdm(geojson_files, desc="Creating MBTiles"):
-            # Extract year and month from filename
-            filename = os.path.basename(geojson_file)
-            parts = filename.replace('_land.geojson', '').split('_')
-            month = parts[1]
-            year = parts[2]
-            
-            output_mbtiles = os.path.join(self.MBTILES_DIR, f"temperature_{month}_{year}_land.mbtiles")
-            
-            if self.geojson_to_mbtiles_tippecanoe(geojson_file, output_mbtiles):
-                mbtiles_files.append(output_mbtiles)
-                successful += 1
-        
-        print(f"✅ Created {successful}/{len(geojson_files)} MBTiles")
-        
-        return mbtiles_files
-
-    def create_tileserver_config(self, mbtiles_files):
-        """Create tileserver-gl configuration for temperature tiles"""
-        print("\n[STEP 5] Creating TileServer Configuration")
-        print("-" * 40)
-        
-        config = {
-            "options": {
-                "paths": {
-                    "root": "",
-                    "mbtiles": f"./{self.MBTILES_DIR}"
-                },
-                "serveStaticMaps": True,
-                "formatQuality": {
-                    "jpeg": 90,
-                    "webp": 90
-                },
-                "maxSize": 8192
-            },
-            "data": {}
-        }
-        
-        # Add each MBTiles file to config
-        for mbtiles_file in mbtiles_files:
-            base_name = os.path.basename(mbtiles_file).replace('_land.mbtiles', '')
-            config["data"][f"{base_name}_land"] = {"mbtiles": os.path.basename(mbtiles_file)}
-        
-        # Save config
-        config_file = "temperature-tileserver-config.json"
-        with open(config_file, 'w') as f:
-            json.dump(config, f, indent=2)
-        
-        print(f"✅ Created tileserver config: {config_file}")
-        return config_file
-
-    def create_web_viewer(self):
-        """Create HTML viewer for temperature tiles"""
-        html_content = """<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Temperature Data Viewer</title>
-    <script src='https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.js'></script>
-    <link href='https://api.mapbox.com/mapbox-gl-js/v2.15.0/mapbox-gl.css' rel='stylesheet' />
-    <style>
-        body { margin: 0; padding: 0; font-family: Arial, sans-serif; }
-        #map { position: absolute; top: 0; bottom: 0; width: 100%; }
-        .controls {
-            position: absolute;
-            top: 10px;
-            left: 10px;
-            z-index: 1000;
-            background: rgba(255, 255, 255, 0.95);
-            padding: 15px;
-            border-radius: 8px;
-            box-shadow: 0 2px 15px rgba(0,0,0,0.2);
-            min-width: 300px;
-        }
-        .controls h3 {
-            margin: 0 0 15px 0;
-            color: #2c5282;
-            font-size: 18px;
-        }
-        select, button {
-            margin: 5px;
-            padding: 8px 12px;
-            border: 1px solid #cbd5e0;
-            border-radius: 4px;
-            font-size: 14px;
-        }
-        button {
-            background: #3182ce;
-            color: white;
-            cursor: pointer;
-            border: none;
-        }
-        button:hover {
-            background: #2c5282;
-        }
-        .info {
-            position: absolute;
-            bottom: 10px;
-            left: 10px;
-            z-index: 1000;
-            background: rgba(0, 0, 0, 0.85);
-            color: white;
-            padding: 12px;
-            border-radius: 6px;
-            font-family: monospace;
-            font-size: 12px;
-        }
-        .legend {
-            position: absolute;
-            bottom: 10px;
-            right: 10px;
-            z-index: 1000;
-            background: rgba(255, 255, 255, 0.95);
-            padding: 15px;
-            border-radius: 8px;
-            box-shadow: 0 2px 15px rgba(0,0,0,0.2);
-        }
-        .legend h4 {
-            margin: 0 0 10px 0;
-            font-size: 14px;
-        }
-        .color-bar {
-            width: 200px;
-            height: 20px;
-            background: linear-gradient(to right, 
-                #8B4513 0%, 
-                #D2691E 25%, 
-                #FFD700 50%, 
-                #32CD32 75%, 
-                #0000FF 100%);
-            border: 1px solid #ccc;
-            margin-bottom: 5px;
-        }
-        .legend-labels {
-            display: flex;
-            justify-content: space-between;
-            font-size: 11px;
-            color: #666;
-        }
-    </style>
-</head>
-<body>
-    <div class="controls">
-        <h3>🌡️ Temperature Data Viewer</h3>
-        <div>
-            <label for="yearSelect">Year:</label>
-            <select id="yearSelect">
-                <option value="2022">2022</option>
-                <option value="2023">2023</option>
-                <option value="2024" selected>2024</option>
-                <option value="2025">2025</option>
-            </select>
-        </div>
-        
-        <div>
-            <label for="monthSelect">Month:</label>
-            <select id="monthSelect">
-                <option value="01">January</option>
-                <option value="02">February</option>
-                <option value="03">March</option>
-                <option value="04">April</option>
-                <option value="05">May</option>
-                <option value="06" selected>June</option>
-                <option value="07">July</option>
-                <option value="08">August</option>
-                <option value="09">September</option>
-                <option value="10">October</option>
-                <option value="11">November</option>
-                <option value="12">December</option>
-            </select>
-        </div>
-        
-        <button onclick="updateLayer()">Update Layer</button>
-        <button onclick="toggleOpacity()">Toggle Opacity</button>
-    </div>
-
-    <div class="legend">
-        <h4>Temperature (°C)</h4>
-        <div class="color-bar"></div>
-        <div class="legend-labels">
-            <span>-40°C</span>
-            <span>-10°C</span>
-            <span>20°C</span>
-            <span>35°C</span>
-            <span>50°C</span>
-        </div>
-    </div>
-
-    <div class="info">
-        <div>Tile Server: <span id="serverStatus">Checking...</span></div>
-        <div>Current Layer: <span id="currentLayer">-</span></div>
-        <div>Zoom Level: <span id="zoomLevel">-</span></div>
-        <div>Data: NASA POWER T2M (Monthly)</div>
-    </div>
-
-    <div id="map"></div>
-
-    <script>
-        // Initialize map
-        const map = new mapboxgl.Map({
-            container: 'map',
-            style: {
-                version: 8,
-                sources: {},
-                layers: [
-                    {
-                        id: 'background',
-                        type: 'background',
-                        paint: {
-                            'background-color': '#f0f8ff'
-                        }
-                    }
-                ]
-            },
-            center: [78.9629, 20.5937], // Center of India
-            zoom: 4
-        });
-
-        let currentOpacity = 0.8;
-        const tileServerUrl = 'http://localhost:8080';
-
-        // Check if tile server is running
-        function checkTileServer() {
-            fetch(tileServerUrl)
-                .then(response => {
-                    if (response.ok) {
-                        document.getElementById('serverStatus').textContent = 'Online ✓';
-                        document.getElementById('serverStatus').style.color = '#48bb78';
-                    } else {
-                        throw new Error('Server responded with error');
-                    }
-                })
-                .catch(error => {
-                    document.getElementById('serverStatus').textContent = 'Offline ✗';
-                    document.getElementById('serverStatus').style.color = '#e53e3e';
-                });
-        }
-
-        // Update the temperature layer
-        function updateLayer() {
-            const year = document.getElementById('yearSelect').value;
-            const month = document.getElementById('monthSelect').value;
-            const layerId = `temperature_${month}_${year}_land`;
-            
-            // Remove existing temperature layer if it exists
-            if (map.getLayer('temperature-layer')) {
-                map.removeLayer('temperature-layer');
-            }
-            if (map.getSource('temperature-source')) {
-                map.removeSource('temperature-source');
-            }
-
-            // Add new temperature layer
-            map.addSource('temperature-source', {
-                type: 'raster',
-                tiles: [`${tileServerUrl}/data/${layerId}/{z}/{x}/{y}.png`],
-                tileSize: 256,
-                minzoom: 0,
-                maxzoom: 18
-            });
-
-            map.addLayer({
-                id: 'temperature-layer',
-                type: 'raster',
-                source: 'temperature-source',
-                paint: {
-                    'raster-opacity': currentOpacity
-                }
-            });
-
-            document.getElementById('currentLayer').textContent = layerId;
-        }
-
-        // Toggle layer opacity
-        function toggleOpacity() {
-            currentOpacity = currentOpacity === 0.8 ? 0.4 : 0.8;
-            if (map.getLayer('temperature-layer')) {
-                map.setPaintProperty('temperature-layer', 'raster-opacity', currentOpacity);
-            }
-        }
-
-        // Update zoom level display
-        map.on('zoom', () => {
-            document.getElementById('zoomLevel').textContent = Math.round(map.getZoom() * 100) / 100;
-        });
-
-        // Initialize
-        map.on('load', () => {
-            updateLayer();
-            checkTileServer();
-            setInterval(checkTileServer, 5000);
-        });
-
-        // Add navigation controls
-        map.addControl(new mapboxgl.NavigationControl());
-        map.addControl(new mapboxgl.FullscreenControl());
-    </script>
-</body>
-</html>"""
-        
-        with open('temperature-viewer.html', 'w') as f:
-            f.write(html_content)
-        
-        print("✅ Created web viewer: temperature-viewer.html")
-
-    def run_complete_pipeline(self):
-        """Run the complete temperature processing pipeline"""
-        start_time = time.time()
-        
-        print("🚀 Starting Complete Temperature Processing Pipeline")
-        print("=" * 60)
-        
-        # Step 1: Download data
-        df = self.download_temperature_data()
-        if df is None:
-            print("❌ Pipeline failed at data download step")
-            return False
-        
-        # Step 2: Split into monthly files
-        monthly_files = self.split_monthly_data(df)
-        
-        # Step 3: Create GeoJSON files
-        geojson_files = self.create_geojsons(monthly_files)
-        
-        # Step 4: Create MBTiles
-        mbtiles_files = self.create_mbtiles(geojson_files)
-        
-        # Summary
-        elapsed = time.time() - start_time
-        print("\n" + "=" * 60)
-        print("🎉 PIPELINE COMPLETE!")
-        print(f"⏱️ Total execution time: {elapsed:.2f} seconds")
-        print(f"📊 Processed {len(monthly_files)} monthly datasets")
-        print(f"🗺️ Created {len(geojson_files)} GeoJSON files")
-        print(f"📦 Created {len(mbtiles_files)} MBTiles files")
-        print("\n📋 Next steps:")
-        print("1. MBTiles are ready for visualization")
-        print("2. Use with tileserver-gl or similar for web applications")
-        print("3. Files are available in the output directory")
-        print("\n💡 Workflow: CSV → Land Filtering → GeoJSON → MBTiles")
-        
+        lats = sorted(df_land['lat'].unique())
+        lons = sorted(df_land['lon'].unique())
+        lat_res = abs(lats[1]-lats[0]) if len(lats)>1 else 0.5
+        lon_res = abs(lons[1]-lons[0]) if len(lons)>1 else 0.625
+        features = []
+        for _, r in df_land.iterrows():
+            lat, lon, val = r['lat'], r['lon'], r[self.VARIABLE]
+            half_lat, half_lon = lat_res/2, lon_res/2
+            coords = [[
+                [lon-half_lon, lat-half_lat], [lon+half_lon, lat-half_lat],
+                [lon+half_lon, lat+half_lat], [lon-half_lon, lat+half_lat], [lon-half_lon, lat-half_lat]
+            ]]
+            features.append({
+                'type':'Feature',
+                'geometry':{'type':'Polygon','coordinates':coords},
+                'properties':{self.VARIABLE: float(val), 'time': r['time']}
+            })
+        with open(geojson_file, 'w') as f:
+            json.dump({'type':'FeatureCollection','features':features}, f, separators=(',',':'))
         return True
 
-def parse_arguments():
-    """Parse command line arguments"""
-    parser = argparse.ArgumentParser(
-        description='Temperature (T2M) Data Processing Pipeline',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog='''
-Examples:
-  # Process default range (2022-01 to 2025-05)
-  python temperature_pipeline.py
+    def create_geojsons(self, files):
+        print("[STEP 3] Generating GeoJSONs...")
+        outs = []
+        for f in tqdm(files, desc='GeoJSONs'):
+            stem = Path(f).stem  # e.g., 'temperature_06_2022'
+            geojson_name = f"{stem}_land.geojson"
+            out = os.path.join(self.OUTPUT_DIR, geojson_name)
+            if self.csv_to_geojson(f, out):
+                outs.append(out)
+        return outs
 
-  # Process only 2023 data
-  python temperature_pipeline.py --start-year 2023 --end-year 2023
+    def geojson_to_mbtiles(self, gj, mb):
+        if not self.check_tippecanoe():
+            return False
+        if os.path.exists(mb):
+            os.remove(mb)
+        cmd = [
+            'tippecanoe', '-o', mb,
+            '-Z', str(self.zoom_min), '-z', str(self.zoom_max),
+            '--no-feature-limit', '--no-tile-size-limit',
+            '--drop-densest-as-needed', '--extend-zooms-if-still-dropping',
+            '--force', '--quiet', gj
+        ]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+        return r.returncode == 0 and os.path.getsize(mb) > 0
 
-  # Process summer 2024 (June-August)
-  python temperature_pipeline.py --start-year 2024 --start-month 6 --end-year 2024 --end-month 8
+    def create_mbtiles_batch(self, geojsons):
+        print("[STEP 4] Generating MBTiles...")
+        outs = []
+        for gj in tqdm(geojsons, desc='MBTiles'):
+            stem = Path(gj).stem  # e.g., 'temperature_06_2022_land'
+            mb_name = f"{stem}.mbtiles"
+            mb = os.path.join(self.MBTILES_DIR, mb_name)
+            if self.geojson_to_mbtiles(gj, mb):
+                outs.append(mb)
+        return outs
 
-  # Process winter 2022-2023 (Dec-Feb)
-  python temperature_pipeline.py --start-year 2022 --start-month 12 --end-year 2023 --end-month 2
+    def create_tileserver_config(self, mbtiles):
+        print("[STEP 5] Tileserver config...")
+        cfg = {'options':{'paths':{'root':'','mbtiles': f"./{self.MBTILES_DIR}"}}, 'data':{}}
+        for m in mbtiles:
+            name = Path(m).stem  # e.g., 'temperature_06_2022_land'
+            cfg['data'][name] = {'mbtiles': Path(m).name}
+        with open('temperature-tileserver-config.json', 'w') as f:
+            json.dump(cfg, f, indent=2)
+        return 'temperature-tileserver-config.json'
 
-  # Process first half of 2024
-  python temperature_pipeline.py --start-year 2024 --start-month 1 --end-year 2024 --end-month 6
+    def run(self, args):
+        start = time.time()
+        # Step 1: download or load CSV
+        df = None
+        if not args.skip_download:
+            df = self.download_data()
+            if df is None:
+                return
+        else:
+            path = os.path.join(self.OUTPUT_DIR, f"{self.PREFIX}_monthly_{self.start_year}_{self.end_year}.csv")
+            if not os.path.exists(path):
+                return
+            df = pd.read_csv(path)
+        # Step 2: split monthly CSVs
+        monthly = self.split_monthly(df)
+        # Step 3: create GeoJSONs
+        geojsons = [] if args.skip_geojson else self.create_geojsons(monthly)
+        # Step 4: create MBTiles
+        mbtiles = [] if args.skip_mbtiles else self.create_mbtiles_batch(geojsons)
+        # Step 5: tileserver config
+        cfg = self.create_tileserver_config(mbtiles)
+        print(f"Pipeline complete in {time.time()-start:.1f}s: {len(monthly)} CSVs, {len(geojsons)} GeoJSONs, {len(mbtiles)} MBTiles")
+        print("Next: tileserver-gl --config", cfg)
 
-  # Custom output directories
-  python temperature_pipeline.py --output-dir custom_temp_data --mbtiles-dir custom_temp_tiles
-        '''
-    )
-    
-    parser.add_argument('--start-year', type=int, default=2022,
-                        help='Starting year (default: 2022)')
-    parser.add_argument('--start-month', type=int, default=1,
-                        help='Starting month (1-12, default: 1)')
-    parser.add_argument('--end-year', type=int, default=2025,
-                        help='Ending year (default: 2025)')
-    parser.add_argument('--end-month', type=int, default=5,
-                        help='Ending month (1-12, default: 5)')
-    parser.add_argument('--output-dir', type=str, default='temperature_data_output',
-                        help='Output directory for data files (default: temperature_data_output)')
-    parser.add_argument('--mbtiles-dir', type=str, default='temperature_mbtiles_output',
-                        help='Output directory for MBTiles files (default: temperature_mbtiles_output)')
-    parser.add_argument('--variable', type=str, default='T2M',
-                        help='Variable name to process (default: T2M)')
-    
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="NASA POWER T2M CLI")
+    parser.add_argument('--start-year', type=int, default=2022)
+    parser.add_argument('--start-month', type=int, default=1)
+    parser.add_argument('--end-year', type=int, default=2025)
+    parser.add_argument('--end-month', type=int, default=5)
+    parser.add_argument('--output-dir', default='temperature_data_output')
+    parser.add_argument('--mbtiles-dir', default='temperature_mbtiles_output')
+    parser.add_argument('--zoom-min', type=int, default=0)
+    parser.add_argument('--zoom-max', type=int, default=10)
+    parser.add_argument('--skip-download', action='store_true')
+    parser.add_argument('--skip-geojson', action='store_true')
+    parser.add_argument('--skip-mbtiles', action='store_true')
     args = parser.parse_args()
-    
-    # Validate arguments
-    if args.start_month < 1 or args.start_month > 12:
-        parser.error("start-month must be between 1 and 12")
-    if args.end_month < 1 or args.end_month > 12:
-        parser.error("end-month must be between 1 and 12")
-    if args.start_year < 1980 or args.start_year > 2030:
-        parser.error("start-year must be between 1980 and 2030")
-    if args.end_year < 1980 or args.end_year > 2030:
-        parser.error("end-year must be between 1980 and 2030")
-    if args.start_year > args.end_year:
-        parser.error("start-year cannot be greater than end-year")
-    if args.start_year == args.end_year and args.start_month > args.end_month:
-        parser.error("start-month cannot be greater than end-month when processing the same year")
-    
-    return args
 
-if __name__ == "__main__":
-    # Parse command line arguments
-    args = parse_arguments()
-    
-    print("🌡️ Temperature Data Processing Pipeline - CLI Mode")
-    print("=" * 60)
-    print(f"📅 Date Range: {args.start_year:04d}-{args.start_month:02d} to {args.end_year:04d}-{args.end_month:02d}")
-    print(f"📁 Output Directory: {args.output_dir}")
-    print(f"🗂️ MBTiles Directory: {args.mbtiles_dir}")
-    print(f"📊 Variable: {args.variable}")
-    print("=" * 60)
-    
-    # Create processor with CLI arguments
-    processor = TemperatureProcessor(
-        start_year=args.start_year,
-        start_month=args.start_month,
-        end_year=args.end_year,
-        end_month=args.end_month,
-        output_dir=args.output_dir,
-        mbtiles_dir=args.mbtiles_dir,
-        variable=args.variable
-    )
-    
-    processor.run_complete_pipeline()
+    processor = TemperatureProcessor(args)
+    processor.run(args)
