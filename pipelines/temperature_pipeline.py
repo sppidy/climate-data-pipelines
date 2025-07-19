@@ -18,6 +18,7 @@ CLI Flags:
 Author: Adapted for IITM Internship Project
 Date: July 2025
 """
+
 import xarray as xr
 import pandas as pd
 import os
@@ -33,7 +34,7 @@ from global_land_mask import globe
 class TemperatureProcessor:
     def __init__(self, args):
         self.ZARR_URL = "s3://nasa-power/merra2/temporal/power_merra2_monthly_temporal_utc.zarr"
-        self.VARIABLE = "T2M"
+        self.VARIABLE = "T2M"  # used for downloading only
         self.PREFIX = "temperature"
         self.start_year = args.start_year
         self.start_month = args.start_month
@@ -49,7 +50,7 @@ class TemperatureProcessor:
 
     def check_tippecanoe(self):
         try:
-            res = subprocess.run(['tippecanoe','--version'], capture_output=True, text=True, timeout=10)
+            res = subprocess.run(['tippecanoe', '--version'], capture_output=True, text=True, timeout=10)
             return res.returncode == 0
         except Exception:
             return False
@@ -65,7 +66,7 @@ class TemperatureProcessor:
             ds = xr.open_dataset(
                 self.ZARR_URL,
                 engine='zarr',
-                backend_kwargs={'consolidated':True,'storage_options':{'anon':True}}
+                backend_kwargs={'consolidated': True, 'storage_options': {'anon': True}}
             )
             times = pd.to_datetime(ds.time.values)
             filt = times[self.time_filter(times)]
@@ -85,10 +86,10 @@ class TemperatureProcessor:
         df['year'] = pd.to_datetime(df['time']).dt.year
         df['month'] = pd.to_datetime(df['time']).dt.month
         files = []
-        for (year, month), grp in tqdm(df.groupby(['year','month']), desc='Monthly files'):
+        for (year, month), grp in tqdm(df.groupby(['year', 'month']), desc='Monthly files'):
             filename = f"{self.PREFIX}_{month:02d}_{year}.csv"
             path = os.path.join(self.OUTPUT_DIR, filename)
-            grp[['time','lat','lon',self.VARIABLE]].to_csv(path, index=False)
+            grp[['time', 'lat', 'lon', self.VARIABLE]].to_csv(path, index=False)
             files.append(path)
         return files
 
@@ -100,23 +101,23 @@ class TemperatureProcessor:
             return False
         lats = sorted(df_land['lat'].unique())
         lons = sorted(df_land['lon'].unique())
-        lat_res = abs(lats[1]-lats[0]) if len(lats)>1 else 0.5
-        lon_res = abs(lons[1]-lons[0]) if len(lons)>1 else 0.625
+        lat_res = abs(lats[1] - lats[0]) if len(lats) > 1 else 0.5
+        lon_res = abs(lons[1] - lons[0]) if len(lons) > 1 else 0.625
         features = []
         for _, r in df_land.iterrows():
             lat, lon, val = r['lat'], r['lon'], r[self.VARIABLE]
-            half_lat, half_lon = lat_res/2, lon_res/2
+            half_lat, half_lon = lat_res / 2, lon_res / 2
             coords = [[
-                [lon-half_lon, lat-half_lat], [lon+half_lon, lat-half_lat],
-                [lon+half_lon, lat+half_lat], [lon-half_lon, lat+half_lat], [lon-half_lon, lat-half_lat]
+                [lon - half_lon, lat - half_lat], [lon + half_lon, lat - half_lat],
+                [lon + half_lon, lat + half_lat], [lon - half_lon, lat + half_lat], [lon - half_lon, lat - half_lat]
             ]]
             features.append({
-                'type':'Feature',
-                'geometry':{'type':'Polygon','coordinates':coords},
-                'properties':{self.VARIABLE: float(val), 'time': r['time']}
+                'type': 'Feature',
+                'geometry': {'type': 'Polygon', 'coordinates': coords},
+                'properties': {'temperature': float(val), 'time': r['time']}
             })
         with open(geojson_file, 'w') as f:
-            json.dump({'type':'FeatureCollection','features':features}, f, separators=(',',':'))
+            json.dump({'type': 'FeatureCollection', 'features': features}, f, separators=(',', ':'))
         return True
 
     def create_geojsons(self, files):
@@ -158,7 +159,7 @@ class TemperatureProcessor:
 
     def create_tileserver_config(self, mbtiles):
         print("[STEP 5] Tileserver config...")
-        cfg = {'options':{'paths':{'root':'','mbtiles': f"./{self.MBTILES_DIR}"}}, 'data':{}}
+        cfg = {'options': {'paths': {'root': '', 'mbtiles': f"./{self.MBTILES_DIR}"}}, 'data': {}}
         for m in mbtiles:
             name = Path(m).stem  # e.g., 'temperature_06_2022_land'
             cfg['data'][name] = {'mbtiles': Path(m).name}
@@ -168,7 +169,6 @@ class TemperatureProcessor:
 
     def run(self, args):
         start = time.time()
-        # Step 1: download or load CSV
         df = None
         if not args.skip_download:
             df = self.download_data()
@@ -179,15 +179,11 @@ class TemperatureProcessor:
             if not os.path.exists(path):
                 return
             df = pd.read_csv(path)
-        # Step 2: split monthly CSVs
         monthly = self.split_monthly(df)
-        # Step 3: create GeoJSONs
         geojsons = [] if args.skip_geojson else self.create_geojsons(monthly)
-        # Step 4: create MBTiles
         mbtiles = [] if args.skip_mbtiles else self.create_mbtiles_batch(geojsons)
-        # Step 5: tileserver config
         cfg = self.create_tileserver_config(mbtiles)
-        print(f"Pipeline complete in {time.time()-start:.1f}s: {len(monthly)} CSVs, {len(geojsons)} GeoJSONs, {len(mbtiles)} MBTiles")
+        print(f"Pipeline complete in {time.time() - start:.1f}s: {len(monthly)} CSVs, {len(geojsons)} GeoJSONs, {len(mbtiles)} MBTiles")
         print("Next: tileserver-gl --config", cfg)
 
 if __name__ == '__main__':
